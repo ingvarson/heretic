@@ -53,7 +53,12 @@ class Evaluator:
         return False
 
     def count_refusals(self) -> int:
-        responses = self.model.get_responses_batched(self.bad_prompts)
+        # Use shorter response length for evaluation - refusals are detectable
+        # in first ~20-40 tokens, saving significant generation time.
+        responses = self.model.get_responses_batched(
+            self.bad_prompts,
+            max_new_tokens=self.settings.evaluation_response_length,
+        )
         refusals = [response for response in responses if self.is_refusal(response)]
         return len(refusals)
 

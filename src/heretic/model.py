@@ -288,6 +288,10 @@ class Model:
                 refusal_direction,
             ).to(self.model.dtype)
 
+        # Cache projectors per device to avoid redundant .to() calls in multi-GPU setups.
+        # This is especially helpful when multiple matrices are on the same device.
+        device_projector_cache: dict[torch.device, Tensor] = {}
+
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(self.get_layers())):
@@ -319,10 +323,15 @@ class Model:
                         layer_refusal_direction,
                         layer_refusal_direction,
                     ).to(self.model.dtype)
+                    # Clear device cache for per-layer mode since projector changes each layer
+                    device_projector_cache.clear()
 
                 for matrix in matrices:
-                    # Ensure projector is on the same device as the matrix for multi-GPU support.
-                    device_projector = projector.to(matrix.device)
+                    # Use cached device projector if available, otherwise transfer and cache
+                    device = matrix.device
+                    if device not in device_projector_cache:
+                        device_projector_cache[device] = projector.to(device)
+                    device_projector = device_projector_cache[device]
                     # In-place subtraction is safe as we're not using Autograd.
                     matrix.sub_(ablation_weight * (device_projector @ matrix))
 
@@ -359,10 +368,15 @@ class Model:
             do_sample=False,  # Use greedy decoding to ensure deterministic outputs.
         )
 
-    def get_responses(self, prompts: list[str]) -> list[str]:
+    def get_responses(
+        self, prompts: list[str], max_new_tokens: int | None = None
+    ) -> list[str]:
+        if max_new_tokens is None:
+            max_new_tokens = self.settings.max_response_length
+
         inputs, outputs = self.generate(
             prompts,
-            max_new_tokens=self.settings.max_response_length,
+            max_new_tokens=max_new_tokens,
         )
 
         # Return only the newly generated part.
@@ -371,11 +385,13 @@ class Model:
             skip_special_tokens=True,
         )
 
-    def get_responses_batched(self, prompts: list[str]) -> list[str]:
+    def get_responses_batched(
+        self, prompts: list[str], max_new_tokens: int | None = None
+    ) -> list[str]:
         responses = []
 
         for batch in batchify(prompts, self.settings.batch_size):
-            for response in self.get_responses(batch):
+            for response in self.get_responses(batch, max_new_tokens):
                 responses.append(response)
 
         return responses

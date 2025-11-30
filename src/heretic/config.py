@@ -68,6 +68,13 @@ class Settings(BaseSettings):
         description="Maximum number of tokens to generate for each response.",
     )
 
+    evaluation_response_length: int = Field(
+        default=40,
+        description="Maximum tokens for refusal detection during evaluation. "
+        "Shorter than max_response_length since refusals are detectable in first ~20-40 tokens. "
+        "This significantly speeds up evaluation without quality loss.",
+    )
+
     print_refusal_geometry: bool = Field(
         default=False,
         description="Whether to print detailed information about residuals and refusal directions after calculating them.",

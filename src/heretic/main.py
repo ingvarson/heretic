@@ -252,9 +252,41 @@ def run():
         print("[bold]S(x,y)[/] = cosine similarity of [bold]x[/] and [bold]y[/]")
         print("[bold]|x|[/] = L2 norm of [bold]x[/]")
 
-    # Keep residuals for quality improvement options in the objective function.
-    # They will be used if optimize_direction_method or optimize_winsorization is True.
-    # (These are deleted after optimization completes.)
+    # Pre-compute all 4 direction variants for quality improvement options.
+    # This avoids redundant computation during trials since there are only 4 combinations:
+    # (projected, winsorized): (False, False), (True, False), (False, True), (True, True)
+    from .utils import compute_projected_direction, winsorize_residuals
+
+    print()
+    print("Pre-computing direction variants...")
+    direction_variants: dict[tuple[bool, bool], torch.Tensor] = {}
+
+    for use_winsorization in [False, True]:
+        if use_winsorization:
+            good_res = winsorize_residuals(good_residuals, settings.winsorize_percentile)
+            bad_res = winsorize_residuals(bad_residuals, settings.winsorize_percentile)
+        else:
+            good_res = good_residuals
+            bad_res = bad_residuals
+
+        raw_refusal = bad_res.mean(dim=0) - good_res.mean(dim=0)
+
+        for use_projected in [False, True]:
+            if use_projected:
+                projected_refusal = compute_projected_direction(raw_refusal, good_res)
+            else:
+                projected_refusal = raw_refusal
+
+            direction_variants[(use_projected, use_winsorization)] = F.normalize(
+                projected_refusal, p=2, dim=1
+            )
+
+    print(f"* Pre-computed [bold]{len(direction_variants)}[/] direction variants")
+
+    # Residuals are no longer needed after pre-computing directions.
+    # Delete them to free up memory (especially important for large models).
+    del good_residuals, bad_residuals
+    empty_cache()
 
     # Checkpoint model weights to CPU memory for fast restoration during trials.
     # This avoids disk I/O for each trial reload, saving 50-110 seconds per trial
@@ -295,29 +327,8 @@ def run():
         trial.set_user_attr("use_projected", use_projected)
         trial.set_user_attr("use_winsorization", use_winsorization)
 
-        # === Compute trial-specific refusal directions ===
-
-        # Apply winsorization if enabled
-        if use_winsorization:
-            from .utils import winsorize_residuals
-
-            good_res = winsorize_residuals(good_residuals, settings.winsorize_percentile)
-            bad_res = winsorize_residuals(bad_residuals, settings.winsorize_percentile)
-        else:
-            good_res = good_residuals
-            bad_res = bad_residuals
-
-        # Compute raw difference-of-means
-        raw_refusal = bad_res.mean(dim=0) - good_res.mean(dim=0)
-
-        # Apply projection if enabled
-        if use_projected:
-            from .utils import compute_projected_direction
-
-            raw_refusal = compute_projected_direction(raw_refusal, good_res)
-
-        # Normalize to get final directions
-        trial_refusal_directions = F.normalize(raw_refusal, p=2, dim=1)
+        # Look up pre-computed refusal directions (much faster than recomputing)
+        trial_refusal_directions = direction_variants[(use_projected, use_winsorization)]
 
         # === Direction scope and weight parameters ===
 
@@ -498,27 +509,10 @@ def run():
         print()
         print(f"Restoring model from trial [bold]{trial.user_attrs['index']}[/]...")
 
-        # Recompute trial-specific directions using stored settings
+        # Look up pre-computed directions using stored settings
         use_projected = trial.user_attrs.get("use_projected", False)
         use_winsorization = trial.user_attrs.get("use_winsorization", False)
-
-        if use_winsorization:
-            from .utils import winsorize_residuals
-
-            good_res = winsorize_residuals(good_residuals, settings.winsorize_percentile)
-            bad_res = winsorize_residuals(bad_residuals, settings.winsorize_percentile)
-        else:
-            good_res = good_residuals
-            bad_res = bad_residuals
-
-        raw_refusal = bad_res.mean(dim=0) - good_res.mean(dim=0)
-
-        if use_projected:
-            from .utils import compute_projected_direction
-
-            raw_refusal = compute_projected_direction(raw_refusal, good_res)
-
-        trial_refusal_directions = F.normalize(raw_refusal, p=2, dim=1)
+        trial_refusal_directions = direction_variants[(use_projected, use_winsorization)]
 
         print("* Reloading model...")
         model.reload_model()
@@ -664,10 +658,6 @@ def run():
 
             except Exception as error:
                 print(f"[red]Error: {error}[/]")
-
-    # Clean up residuals now that trial selection is complete.
-    del good_residuals, bad_residuals
-    empty_cache()
 
 
 def main():
