@@ -73,8 +73,18 @@ class Evaluator:
         ).item()
         print(f"  * KL divergence: [bold]{kl_divergence:.2f}[/]")
 
-        print("  * Counting model refusals...")
-        refusals = self.count_refusals()
+        # Early pruning: skip refusal counting if KL is too high (model too damaged)
+        threshold = self.settings.kl_divergence_threshold
+        if threshold > 0 and kl_divergence > threshold:
+            print(
+                f"  * [yellow]KL divergence exceeds threshold ({threshold:.2f}), "
+                f"skipping refusal count[/]"
+            )
+            # Return base_refusals to indicate no improvement
+            refusals = self.base_refusals
+        else:
+            print("  * Counting model refusals...")
+            refusals = self.count_refusals()
         print(f"  * Refusals: [bold]{refusals}[/]/{len(self.bad_prompts)}")
 
         score = (

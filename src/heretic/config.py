@@ -88,6 +88,14 @@ class Settings(BaseSettings):
         ),
     )
 
+    kl_divergence_threshold: float = Field(
+        default=1.0,
+        description=(
+            "If KL divergence exceeds this threshold, skip refusal counting and treat trial as failed. "
+            "This saves time on clearly bad trials. Set to 0 to disable early pruning."
+        ),
+    )
+
     n_trials: int = Field(
         default=200,
         description="Number of abliteration trials to run during optimization.",
