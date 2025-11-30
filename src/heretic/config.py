@@ -91,6 +91,22 @@ class Settings(BaseSettings):
         description="Number of trials that use random sampling for the purpose of exploration.",
     )
 
+    # Quality improvement options (added to Optuna search space)
+    optimize_direction_method: bool = Field(
+        default=True,
+        description="Include direction method (standard vs projected) in Optuna optimization.",
+    )
+
+    optimize_winsorization: bool = Field(
+        default=True,
+        description="Include winsorization option in Optuna optimization.",
+    )
+
+    winsorize_percentile: float = Field(
+        default=99.5,
+        description="Percentile for Winsorization clipping when enabled.",
+    )
+
     refusal_markers: list[str] = Field(
         default=[
             "sorry",

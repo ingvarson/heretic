@@ -178,6 +178,75 @@ def batchify(items: list[T], batch_size: int) -> list[list[T]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
+def winsorize_residuals(residuals: torch.Tensor, percentile: float = 99.5) -> torch.Tensor:
+    """
+    Winsorize residuals by clipping values beyond the specified percentile.
+
+    This handles outliers from GeGLU activations that can skew mean computation.
+    Based on grimjim's projected abliteration technique.
+
+    Args:
+        residuals: Tensor of shape (n_prompts, n_layers, hidden_dim)
+        percentile: Percentile threshold for clipping (default 99.5)
+
+    Returns:
+        Winsorized residuals with same shape, outliers clipped to threshold
+    """
+    n_prompts, n_layers, hidden_dim = residuals.shape
+
+    # Compute threshold per layer (across prompts and hidden dimensions)
+    thresholds = []
+    for layer_idx in range(n_layers):
+        layer_data = residuals[:, layer_idx, :].abs()
+        threshold = torch.quantile(
+            layer_data.flatten().float(),  # quantile requires float
+            percentile / 100.0,
+        ).to(residuals.dtype)
+        thresholds.append(threshold)
+
+    # Shape: (1, n_layers, 1) for broadcasting
+    thresholds = torch.stack(thresholds).view(1, n_layers, 1)
+
+    return residuals.clamp(-thresholds, thresholds)
+
+
+def compute_projected_direction(
+    raw_refusal: torch.Tensor,
+    good_residuals: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute projected refusal direction using grimjim's method.
+
+    Projects out the component of the refusal direction that aligns with
+    the harmless mean, leaving only the component specific to refusal.
+
+    Formula: r_proj = r - (r · g_hat) * g_hat
+    where g_hat = normalize(mean(good_residuals))
+
+    This removes the "harmless" component from the refusal direction,
+    reducing unnecessary capability damage during abliteration.
+
+    Args:
+        raw_refusal: Raw difference-of-means direction, shape (n_layers, hidden_dim)
+        good_residuals: Harmless residuals, shape (n_prompts, n_layers, hidden_dim)
+
+    Returns:
+        Projected refusal direction, shape (n_layers, hidden_dim)
+    """
+    import torch.nn.functional as F
+
+    # Compute normalized harmless mean
+    good_mean = good_residuals.mean(dim=0)  # (n_layers, hidden_dim)
+    good_mean_normalized = F.normalize(good_mean, p=2, dim=1)
+
+    # Project out harmless component: r_proj = r - (r · g_hat) * g_hat
+    # Dot product per layer: sum over hidden_dim
+    projection_coeff = (raw_refusal * good_mean_normalized).sum(dim=1, keepdim=True)
+    projected = raw_refusal - projection_coeff * good_mean_normalized
+
+    return projected
+
+
 def empty_cache():
     # Collecting garbage is not an idempotent operation, and to avoid OOM errors,
     # gc.collect() has to be called both before and after emptying the backend cache.
@@ -203,11 +272,19 @@ def empty_cache():
 def get_trial_parameters(trial: Trial) -> dict[str, str]:
     params = {}
 
+    # Quality improvement parameters
+    if "use_projected" in trial.user_attrs:
+        params["use_projected_direction"] = str(trial.user_attrs["use_projected"])
+    if "use_winsorization" in trial.user_attrs:
+        params["use_winsorization"] = str(trial.user_attrs["use_winsorization"])
+
+    # Direction parameters
     direction_index = trial.user_attrs["direction_index"]
     params["direction_index"] = (
         "per layer" if (direction_index is None) else f"{direction_index:.2f}"
     )
 
+    # Component parameters
     for component, parameters in trial.user_attrs["parameters"].items():
         for name, value in asdict(parameters).items():
             params[f"{component}.{name}"] = f"{value:.2f}"

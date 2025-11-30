@@ -252,8 +252,16 @@ def run():
         print("[bold]S(x,y)[/] = cosine similarity of [bold]x[/] and [bold]y[/]")
         print("[bold]|x|[/] = L2 norm of [bold]x[/]")
 
-    # We don't need the residuals after computing refusal directions.
-    del good_residuals, bad_residuals
+    # Keep residuals for quality improvement options in the objective function.
+    # They will be used if optimize_direction_method or optimize_winsorization is True.
+    # (These are deleted after optimization completes.)
+
+    # Checkpoint model weights to CPU memory for fast restoration during trials.
+    # This avoids disk I/O for each trial reload, saving 50-110 seconds per trial
+    # for large models (e.g., 70B).
+    print()
+    print("Checkpointing model weights for fast trial restoration...")
+    model.checkpoint_weights()
     empty_cache()
 
     trial_index = 0
@@ -263,6 +271,55 @@ def run():
         nonlocal trial_index
         trial_index += 1
         trial.set_user_attr("index", trial_index)
+
+        # === Quality improvement parameters ===
+
+        # Direction computation method (standard vs projected)
+        if settings.optimize_direction_method:
+            use_projected = trial.suggest_categorical(
+                "use_projected_direction",
+                [True, False],
+            )
+        else:
+            use_projected = False
+
+        # Winsorization for outlier handling
+        if settings.optimize_winsorization:
+            use_winsorization = trial.suggest_categorical(
+                "use_winsorization",
+                [True, False],
+            )
+        else:
+            use_winsorization = False
+
+        trial.set_user_attr("use_projected", use_projected)
+        trial.set_user_attr("use_winsorization", use_winsorization)
+
+        # === Compute trial-specific refusal directions ===
+
+        # Apply winsorization if enabled
+        if use_winsorization:
+            from .utils import winsorize_residuals
+
+            good_res = winsorize_residuals(good_residuals, settings.winsorize_percentile)
+            bad_res = winsorize_residuals(bad_residuals, settings.winsorize_percentile)
+        else:
+            good_res = good_residuals
+            bad_res = bad_residuals
+
+        # Compute raw difference-of-means
+        raw_refusal = bad_res.mean(dim=0) - good_res.mean(dim=0)
+
+        # Apply projection if enabled
+        if use_projected:
+            from .utils import compute_projected_direction
+
+            raw_refusal = compute_projected_direction(raw_refusal, good_res)
+
+        # Normalize to get final directions
+        trial_refusal_directions = F.normalize(raw_refusal, p=2, dim=1)
+
+        # === Direction scope and weight parameters ===
 
         direction_scope = trial.suggest_categorical(
             "direction_scope",
@@ -338,7 +395,7 @@ def run():
         print("* Reloading model...")
         model.reload_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        model.abliterate(trial_refusal_directions, direction_index, parameters)
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score()
 
@@ -382,6 +439,8 @@ def run():
         # is raised just between trials, which wouldn't be caught by the handler
         # defined in objective_wrapper above.
         pass
+
+    # NOTE: Residuals are kept in memory for trial restoration (deleted after trial selection loop).
 
     # If no trials at all have been evaluated, the study must have been stopped
     # by pressing Ctrl+C while the first trial was running. In this case, we just
@@ -438,11 +497,34 @@ def run():
 
         print()
         print(f"Restoring model from trial [bold]{trial.user_attrs['index']}[/]...")
+
+        # Recompute trial-specific directions using stored settings
+        use_projected = trial.user_attrs.get("use_projected", False)
+        use_winsorization = trial.user_attrs.get("use_winsorization", False)
+
+        if use_winsorization:
+            from .utils import winsorize_residuals
+
+            good_res = winsorize_residuals(good_residuals, settings.winsorize_percentile)
+            bad_res = winsorize_residuals(bad_residuals, settings.winsorize_percentile)
+        else:
+            good_res = good_residuals
+            bad_res = bad_residuals
+
+        raw_refusal = bad_res.mean(dim=0) - good_res.mean(dim=0)
+
+        if use_projected:
+            from .utils import compute_projected_direction
+
+            raw_refusal = compute_projected_direction(raw_refusal, good_res)
+
+        trial_refusal_directions = F.normalize(raw_refusal, p=2, dim=1)
+
         print("* Reloading model...")
         model.reload_model()
         print("* Abliterating...")
         model.abliterate(
-            refusal_directions,
+            trial_refusal_directions,
             trial.user_attrs["direction_index"],
             trial.user_attrs["parameters"],
         )
@@ -582,6 +664,10 @@ def run():
 
             except Exception as error:
                 print(f"[red]Error: {error}[/]")
+
+    # Clean up residuals now that trial selection is complete.
+    del good_residuals, bad_residuals
+    empty_cache()
 
 
 def main():

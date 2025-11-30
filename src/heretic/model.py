@@ -2,6 +2,7 @@
 # Copyright (C) 2025  Philipp Emanuel Weidmann <pew@worldwidemann.com>
 
 import math
+from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -94,6 +95,16 @@ class Model:
             )
 
     def reload_model(self):
+        """
+        Reset model to original state.
+        Uses checkpoint if available (fast), otherwise reloads from disk (slow).
+        """
+        if self.has_checkpoint():
+            # Fast path: restore from CPU memory checkpoint
+            self.restore_weights()
+            return
+
+        # Slow path: reload from disk (original implementation)
         dtype = self.model.dtype
 
         # Purge existing model object from memory to make space.
@@ -109,6 +120,61 @@ class Model:
 
         if self.trusted_models.get(self.settings.model) is None:
             self.trusted_models[self.settings.model] = True
+
+    def checkpoint_weights(self):
+        """
+        Save a copy of the current model weights to CPU memory.
+        This allows fast restoration without disk I/O.
+
+        For 70B models: saves 50-110 seconds per trial restoration.
+        Memory cost: ~model_size in CPU RAM (e.g., ~140GB for 70B in bf16)
+        """
+        print("  * Saving weight checkpoint to CPU memory...")
+        self._weight_checkpoint: OrderedDict[str, torch.Tensor] = OrderedDict()
+
+        for name, param in self.model.named_parameters():
+            # Store on CPU to avoid GPU memory pressure
+            # Use clone() to ensure we have an independent copy
+            self._weight_checkpoint[name] = param.data.cpu().clone()
+
+        # Also checkpoint any buffers (non-parameter tensors like layer norms)
+        self._buffer_checkpoint: OrderedDict[str, torch.Tensor] = OrderedDict()
+        for name, buffer in self.model.named_buffers():
+            if buffer is not None:
+                self._buffer_checkpoint[name] = buffer.cpu().clone()
+
+        print(
+            f"  * Checkpointed [bold]{len(self._weight_checkpoint)}[/] parameters, "
+            f"[bold]{len(self._buffer_checkpoint)}[/] buffers"
+        )
+
+    def restore_weights(self):
+        """
+        Restore model weights from CPU checkpoint.
+        Much faster than reload_model() which reads from disk.
+
+        For 70B models: ~5-10 seconds vs 60-120 seconds from disk.
+        """
+        if not self.has_checkpoint():
+            raise RuntimeError(
+                "No weight checkpoint available. Call checkpoint_weights() first."
+            )
+
+        for name, param in self.model.named_parameters():
+            checkpoint_data = self._weight_checkpoint[name]
+            # Copy back to the parameter's device (handles multi-GPU sharding)
+            param.data.copy_(checkpoint_data.to(param.device))
+
+        # Restore buffers
+        for name, buffer in self.model.named_buffers():
+            if name in self._buffer_checkpoint and buffer is not None:
+                buffer.copy_(self._buffer_checkpoint[name].to(buffer.device))
+
+    def has_checkpoint(self) -> bool:
+        """Check if a weight checkpoint is available."""
+        return (
+            hasattr(self, "_weight_checkpoint") and self._weight_checkpoint is not None
+        )
 
     def get_layers(self) -> ModuleList:
         # Most multimodal models.
@@ -201,19 +267,26 @@ class Model:
         parameters: dict[str, AbliterationParameters],
     ):
         if direction_index is None:
-            refusal_direction = None
+            # Per-layer mode: compute projector for each layer separately
+            cached_projector = None
         else:
+            # Global mode: compute refusal direction and cache the projector
             # The index must be shifted by 1 because the first element
             # of refusal_directions is the direction for the embeddings.
-            weight, index = math.modf(direction_index + 1)
+            interp_weight, index = math.modf(direction_index + 1)
             refusal_direction = F.normalize(
                 refusal_directions[int(index)].lerp(
                     refusal_directions[int(index) + 1],
-                    weight,
+                    interp_weight,
                 ),
                 p=2,
                 dim=0,
             )
+            # Cache the projector for reuse across all layers (minor optimization)
+            cached_projector = torch.outer(
+                refusal_direction,
+                refusal_direction,
+            ).to(self.model.dtype)
 
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
@@ -230,29 +303,28 @@ class Model:
 
                 # Interpolate linearly between max_weight and min_weight
                 # over min_weight_distance.
-                weight = params.max_weight + (distance / params.min_weight_distance) * (
-                    params.min_weight - params.max_weight
-                )
+                ablation_weight = params.max_weight + (
+                    distance / params.min_weight_distance
+                ) * (params.min_weight - params.max_weight)
 
-                if refusal_direction is None:
+                if cached_projector is not None:
+                    # Use cached global projector
+                    projector = cached_projector
+                else:
+                    # Per-layer direction: compute projector for this layer
                     # The index must be shifted by 1 because the first element
                     # of refusal_directions is the direction for the embeddings.
                     layer_refusal_direction = refusal_directions[layer_index + 1]
-                else:
-                    layer_refusal_direction = refusal_direction
-
-                # Projects any right-multiplied vector(s) onto the subspace
-                # spanned by the refusal direction.
-                projector = torch.outer(
-                    layer_refusal_direction,
-                    layer_refusal_direction,
-                ).to(self.model.dtype)
+                    projector = torch.outer(
+                        layer_refusal_direction,
+                        layer_refusal_direction,
+                    ).to(self.model.dtype)
 
                 for matrix in matrices:
                     # Ensure projector is on the same device as the matrix for multi-GPU support.
                     device_projector = projector.to(matrix.device)
                     # In-place subtraction is safe as we're not using Autograd.
-                    matrix.sub_(weight * (device_projector @ matrix))
+                    matrix.sub_(ablation_weight * (device_projector @ matrix))
 
     def get_chat(self, prompt: str) -> list[dict[str, str]]:
         return [
