@@ -136,9 +136,21 @@ class Model:
 
             matrices[component].append(matrix)
 
-        # Exceptions aren't suppressed here, because there is currently
-        # no alternative location for the attention out-projection.
-        try_add("attn.o_proj", layer.self_attn.o_proj.weight)
+        # Standard attention out-projection (most models).
+        attn_found = False
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.self_attn.o_proj.weight)
+            attn_found = True
+
+        # Qwen3-Next: linear attention layers use linear_attn.out_proj instead of self_attn.o_proj.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.linear_attn.out_proj.weight)
+            attn_found = True
+
+        if not attn_found:
+            raise AttributeError(
+                f"Could not find attention out-projection in layer: {type(layer).__name__}"
+            )
 
         # Most dense models.
         with suppress(Exception):
@@ -160,6 +172,10 @@ class Model:
             # in that it stores the down-projections for all experts in a single 3D tensor,
             # but thanks to PyTorch's broadcasting magic, it all just works anyway.
             try_add("mlp.down_proj", layer.mlp.experts.down_proj)
+
+        # Qwen3-Next: sparse MoE with shared_expert.
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mlp.shared_expert.down_proj.weight)
 
         # Granite MoE Hybrid - attention layers with shared_mlp.
         with suppress(Exception):
